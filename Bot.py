@@ -515,24 +515,41 @@ class LobsterScheduler:
 
 
 def run_sub_agent(task):
-    """执行一个子 Agent 任务：内部复用 web_ai_agent 拉起网页版 AI。"""
+    """执行一个子 Agent 任务：内部复用 web_ai_agent 拉起网页版 AI，并把结果回传触发会话。"""
     provider = (task or {}).get('provider', 'deepseek')
     prompt = (task or {}).get('prompt', '')
     system = (task or {}).get('system')
-    return web_ai_agent(provider=provider, prompt=prompt, system=system)
+    answer = web_ai_agent(provider=provider, prompt=prompt, system=system)
+    # 结果路由：其他用户触发的 → 回传该用户会话；主脑(admin)触发的 → 回传主脑会话。
+    # 二者统一为「回传到提交任务时记录的触发 identifier」，由 execute_agent_loop 在工作线程内写入。
+    identifier = task.get('identifier')
+    if identifier and answer and GLOBAL_SOURCE is not None:
+        try:
+            GLOBAL_SOURCE.send_reply(identifier, f"🤖 [{provider}] 子 Agent 回复：\n{truncate_text(answer)}")
+        except Exception as exc:
+            logger.error(f"[LobsterScheduler] 回传子 Agent 结果失败: {exc}")
+    return answer
 
 
 def dispatch_sub_agent(provider='deepseek', prompt='', system=None):
-    """非阻塞地把子 Agent 任务交给 LobsterScheduler（供主脑提示词触发）。"""
+    """非阻塞地把子 Agent 任务交给 LobsterScheduler（供主脑提示词触发）。
+
+    触发会话标识（identifier）在提交时从当前上下文捕获，子 Agent 完成后据此回传：
+    - 由其他用户消息触发 → 结果回传该用户；
+    - 由主脑(admin)自身触发 → 结果回传主脑会话。
+    """
     lobster_scheduler.submit({
         'provider': provider, 'prompt': prompt, 'system': system,
-        'uid': get_current_uid(),
+        'uid': get_current_uid(), 'identifier': get_current_identifier(),
     })
-    return f"✅ 已提交子 Agent 任务（provider={provider}），由调度器并发执行（上限 {lobster_scheduler._max_workers}）。"
+    return f"✅ 已提交子 Agent 任务（provider={provider}），由调度器并发执行（上限 {lobster_scheduler._max_workers}），完成后将回传至触发会话。"
 
 
 # 全局调度器实例（并发上限取 CONFIG.max_sub_agents）
 lobster_scheduler = LobsterScheduler(max_workers=CONFIG.get('max_sub_agents', 3))
+
+# 供调度线程回传子 Agent 结果到触发会话（在 main() 中绑定为当前 NapCatSource）
+GLOBAL_SOURCE = None
 
 # ==================== 安全防护（漏洞加固） ====================
 
@@ -582,16 +599,22 @@ def normalize_newlines(text):
 _actor_uid = contextvars.ContextVar('lobster_uid', default='shared')
 _actor_msgtype = contextvars.ContextVar('lobster_msgtype', default='private')
 _actor_group = contextvars.ContextVar('lobster_group', default=None)
+_actor_identifier = contextvars.ContextVar('lobster_identifier', default=None)
 
 def set_current_message(msg):
     """设置当前正在处理的消息上下文（contextvars 隔离，兼容 Playwright 异步事件循环）"""
     _actor_uid.set(str(msg.get('sender_id', '') or 'shared'))
     _actor_msgtype.set(msg.get('message_type', 'private'))
     _actor_group.set(str(msg.get('group_id')) if msg.get('group_id') else None)
+    _actor_identifier.set(msg.get('identifier'))   # 触发会话标识，供子 Agent 结果回传
 
 def get_current_uid():
     """获取当前操作用户 UID（真实发送者，未设置时回退 shared）"""
     return _actor_uid.get() or 'shared'
+
+def get_current_identifier():
+    """获取当前触发会话标识符（用于把子 Agent 结果回传给正确的会话）"""
+    return _actor_identifier.get()
 
 def get_sandbox_root():
     """当前用户沙盒根：私聊 workspace/{uid}/，群聊 workspace/group_{gid}/{uid}/"""
@@ -1234,6 +1257,15 @@ def build_system_prompt():
 pending_contexts = {}
 
 def execute_agent_loop(user_message, history, identifier, source, max_steps=5):
+    # 路由上下文：线程池工作线程不会继承提交线程的 contextvars，必须在此（同一工作线程内）
+    # 用 identifier 重建上下文，供 dispatch_sub_agent 回传子 Agent 结果，并修复沙盒按用户隔离。
+    # identifier 形如 private_{user_id} / group_{group_id}
+    if identifier and identifier.startswith('group_'):
+        set_current_message({'sender_id': 'shared', 'message_type': 'group', 'group_id': identifier[6:], 'identifier': identifier})
+    elif identifier and identifier.startswith('private_'):
+        set_current_message({'sender_id': identifier[8:], 'message_type': 'private', 'group_id': None, 'identifier': identifier})
+    else:
+        set_current_message({'sender_id': 'shared', 'message_type': 'private', 'group_id': None, 'identifier': identifier})
     # 漏洞4：对每条消息做本地硬截断，避免撑爆网页端上下文
     messages = [
         {"role": m.get("role", "user"), "content": truncate_text(m.get("content", ""))}
@@ -1692,6 +1724,8 @@ def main():
 
     source = NapCatSource()
     source.start()
+    global GLOBAL_SOURCE
+    GLOBAL_SOURCE = source   # 供 LobsterScheduler 的调度线程回传子 Agent 结果
     logger.info("NapCat 已启动，等待消息...")
     print("🦞 小龙虾 v2.0 已启动，等待QQ消息...")
 
