@@ -784,6 +784,25 @@ def builtin_screen_ops(action, target=None, use_kimi_vision=False, **kwargs):
         else:
             return f"不支持的操作: {action}"
 
+def builtin_screenshot(path=None, save_path=None, **kwargs):
+    """内置操作：屏幕截图并保存到沙盒工作区（独立封装，仅负责截图落盘）。
+
+    与 builtin_screen_ops 的视觉分析路径解耦——本函数只做"截图 + 保存"，不做 OCR/视觉识别。
+    - path / save_path: 保存路径；缺省落到 WORKSPACE/screenshot_<时间戳>.png
+    - 多余字段(action/target/use_kimi_vision 等)由 **kwargs 吸收，保证与 builtin(**args) 调用约定兼容
+    - 需要视觉理解请走 builtin(op='screen_ops', args={'action':'screenshot','use_kimi_vision':True})
+    截图属敏感操作，执行会写入行为指纹日志。
+    """
+    # 行为指纹（截图留痕，便于审计谁截了屏）
+    log_behavior_fingerprint(get_current_uid(), 'screenshot', str(path or save_path or 'default'),
+                             cwd=os.getcwd(), env=os.environ)
+    save_to = path or save_path or (WORKSPACE / f"screenshot_{int(time.time())}.png")
+    try:
+        pyautogui.screenshot().save(save_to)
+    except Exception as e:
+        return f"截图失败: {e}"
+    return f"截图已保存至 {save_to}"
+
 # ==================== 内置操作 ====================
 def builtin_install_software(name, mode='winget', install_location='D:\\Software', script_code=None):
     if mode == 'winget':
