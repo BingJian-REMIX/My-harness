@@ -19,6 +19,7 @@ import json
 import re
 import subprocess
 import threading
+import contextvars
 import queue
 import importlib
 import importlib.util
@@ -65,6 +66,8 @@ CONFIG = {
     "max_message_chars": 3000,              # 单条消息硬截断阈值（字）
     "command_guard_blacklist": True,        # 高危命令黑名单（第一层）
     "command_guard_semantic": True,         # Kimi 语义鉴定（第二层）
+    "long_command_chars": 200,              # 行为指纹：单条命令超过此长度视为“长指令”
+    "long_command_review_threshold": 3,     # 行为指纹：连续 N 次长指令触发人工审核
     "playwright_global_timeout": 30,        # Playwright 全局超时（秒）
     "enable_conversation_log": True,
     "enable_context_compression": True,
@@ -488,25 +491,28 @@ def normalize_newlines(text):
         return text
     return text.replace('\r\n', '\n').replace('\r', '\n')
 
-# 漏洞6：线程级用户上下文（uid 来自真实消息发送者，非任意传入字符串）
-_msg_ctx = threading.local()
+# 漏洞6：协程/线程级用户上下文（uid 来自真实消息发送者，非任意传入字符串）
+# 用 contextvars 而非 threading.local：Playwright 运行在异步事件循环下，同一线程内多个协程会并发切换，
+# threading.local 无法隔离协程级上下文，contextvars 才是异步模式下的“线程本地存储”替代品。
+_actor_uid = contextvars.ContextVar('lobster_uid', default='shared')
+_actor_msgtype = contextvars.ContextVar('lobster_msgtype', default='private')
+_actor_group = contextvars.ContextVar('lobster_group', default=None)
 
 def set_current_message(msg):
-    """设置当前线程正在处理的消息上下文（线程隔离，避免并发串扰）"""
-    _msg_ctx.uid = str(msg.get('sender_id', ''))
-    _msg_ctx.message_type = msg.get('message_type', 'private')
-    _msg_ctx.group_id = str(msg.get('group_id', '')) if msg.get('group_id') else None
+    """设置当前正在处理的消息上下文（contextvars 隔离，兼容 Playwright 异步事件循环）"""
+    _actor_uid.set(str(msg.get('sender_id', '') or 'shared'))
+    _actor_msgtype.set(msg.get('message_type', 'private'))
+    _actor_group.set(str(msg.get('group_id')) if msg.get('group_id') else None)
 
 def get_current_uid():
     """获取当前操作用户 UID（真实发送者，未设置时回退 shared）"""
-    uid = getattr(_msg_ctx, 'uid', None)
-    return uid if uid else 'shared'
+    return _actor_uid.get() or 'shared'
 
 def get_sandbox_root():
     """当前用户沙盒根：私聊 workspace/{uid}/，群聊 workspace/group_{gid}/{uid}/"""
     uid = get_current_uid()
-    msg_type = getattr(_msg_ctx, 'message_type', 'private')
-    group_id = getattr(_msg_ctx, 'group_id', None)
+    msg_type = _actor_msgtype.get()
+    group_id = _actor_group.get()
     if msg_type == 'group' and group_id:
         return WORKSPACE / f"group_{group_id}" / uid
     return WORKSPACE / uid
@@ -546,11 +552,72 @@ def guard_command(command):
         for pat in DANGEROUS_COMMAND_PATTERNS:
             if re.search(pat, low):
                 return False, f"高危命令已拦截（命中: {pat}）"
-    if CONFIG.get("command_guard_semantic", True):
+    # 仅高危操作触发 Kimi 语义鉴定（降本增效：低风险指令直接放行，省去一轮 AI 调用）
+    if CONFIG.get("command_guard_semantic", True) and classify_operation_risk(cmd) == 'high':
         ok, reason = semantic_danger_check(cmd)
         if not ok:
             return False, f"高危操作不通过：{reason}"
     return True, ""
+
+# ==================== 意图等级分类（降本增效：仅高危操作触发 Kimi 双AI审查） ====================
+HIGH_RISK_OP_PATTERNS = [
+    # 网络修改
+    r'\b(netsh|iptables|ufw|firewalld|route\s+add|ip\s+route\s+add|crontab\s+-)\b',
+    r'\b(set-netfirewallrule|new-netfirewallrule|add-netfirewallrule|remove-netfirewallrule)\b',
+    # 文件权限
+    r'\b(chmod|chown|chattr|icacls|attrib\s+[+-]|set-acl)\b',
+    # 系统命令执行 / 磁盘 / 进程服务
+    r'\b(shutdown|reboot|halt|poweroff|format|diskpart|mkfs|fdisk|del\s+/[fq]|sdelete|rm\s+-rf|schtasks|sc\s+create|net\s+(stop|start|user)|systemctl|service\s+\w+\s+(stop|start|restart)|taskkill|kill\s+-9|pkill|Stop-Computer|Restart-Computer)\b',
+    # 注册表 / 启动项 / 持久化
+    r'\b(bcdedit|reg\s+(add|delete)|update-rc\.d|systemctl\s+enable)\b',
+    # 磁盘数据破坏
+    r'\b(dd\s+if=|wipefs|shred\s+)\b',
+    # 用户 / 权限
+    r'\b(useradd|adduser|usermod|passwd|net\s+user|sudo)\b',
+    # 下载即执行（夹带私货的高危载体）
+    r'(curl|wget|iwr|invoke-webrequest).*(\|\s*(sh|bash|pwsh|powershell|iex)|downloadstring|clipsex)',
+    r'\b(invoke-expression|iex)\b',
+    # 注册表持久化路径
+    r'\b(HKLM|HKCU)\\',
+]
+
+def classify_operation_risk(text):
+    """意图等级分类：检测高危操作（网络修改/文件权限/系统命令/磁盘/注册表/用户权限/下载即执行）。
+    命中任一高危模式返回 'high'，否则返回 'low'（写UI、读普通文本等低风险操作直接放行，不触发 Kimi 双AI审查）。"""
+    if not text:
+        return 'low'
+    low = text.lower()
+    for pat in HIGH_RISK_OP_PATTERNS:
+        if re.search(pat, low):
+            return 'high'
+    return 'low'
+
+# ==================== 动态行为指纹日志（在既有安全补丁之上再加一层异常行为雷达） ====================
+_behavior_counter = {}  # uid -> 连续长指令计数
+
+def log_behavior_fingerprint(uid, action, command, cwd=None, env=None):
+    """记录命令执行的动态行为指纹（cwd/env/命令/uid），并对连续长指令做人工审核阈值检测。
+    防止 AI 在大量正常指令中夹带私货——一旦某 uid 连续 N 次发出超长指令，触发人工审核。"""
+    fp = {
+        "ts": datetime.now().isoformat(timespec='seconds'),
+        "uid": uid,
+        "action": action,
+        "command": command[:500],
+        "cwd": str(cwd) if cwd else os.getcwd(),
+        "env_keys": sorted(env.keys()) if env else "inherited",
+    }
+    logger.info(f"[行为指纹] {json.dumps(fp, ensure_ascii=False)}")
+    # 连续长指令阈值检测
+    threshold = CONFIG.get("long_command_chars", 200)
+    if len(command) > threshold:
+        _behavior_counter[uid] = _behavior_counter.get(uid, 0) + 1
+    else:
+        _behavior_counter[uid] = 0
+    if _behavior_counter[uid] >= CONFIG.get("long_command_review_threshold", 3):
+        logger.warning(f"[行为指纹] uid={uid} 连续 {_behavior_counter[uid]} 次长指令，触发人工审核！")
+        _behavior_counter[uid] = 0  # 重置，避免重复告警风暴
+        return True  # 需要人工审核
+    return False
 
 # ==================== 视觉操作（Kimi 视觉专家） ====================
 def builtin_screen_ops(action, target=None, use_kimi_vision=False, **kwargs):
@@ -626,6 +693,8 @@ def builtin_install_software(name, mode='winget', install_location='D:\\Software
         tmp_script = Path(WORKSPACE) / f"_install_{name}_{int(time.time())}.py"
         with open(tmp_script, 'w', encoding='utf-8') as f:
             f.write(normalize_newlines(script_code))
+        # 动态行为指纹日志
+        log_behavior_fingerprint(get_current_uid(), 'install_script', script_code[:2000], cwd=str(tmp_script.parent), env=os.environ)
         try:
             result = subprocess.run(['python', str(tmp_script)], capture_output=True, text=True, timeout=300)
             tmp_script.unlink()
@@ -639,6 +708,8 @@ def builtin_install_software(name, mode='winget', install_location='D:\\Software
         return "无效的安装模式或缺少脚本代码"
 
 def builtin_open_app(path):
+    # 动态行为指纹日志
+    log_behavior_fingerprint(get_current_uid(), 'open_app', path, cwd=os.getcwd(), env=os.environ)
     try:
         subprocess.Popen([normalize_newlines(path)], shell=True)
         return f"已打开 {path}"
@@ -871,6 +942,8 @@ def send_to_shell(identifier, shell_type, command):
     proc = session['process']
     output_queue = session['output_queue']
 
+    # 动态行为指纹日志（连续长指令人工审核阈值，详见 log_behavior_fingerprint）
+    log_behavior_fingerprint(get_current_uid(), 'shell_write', command, cwd=os.getcwd(), env=os.environ)
     try:
         proc.stdin.write(normalize_newlines(command) + '\n')
         proc.stdin.flush()
@@ -1137,39 +1210,44 @@ def skill_write_skill(**kwargs):
         return "缺少技能名称或代码"
 
     if CONFIG.get("code_review_enabled"):
-        # 漏洞3：多轮审查 + 死循环斩断，最多 max_review_rounds 轮，超限请求人工介入
-        max_rounds = CONFIG.get("max_review_rounds", 5)
-        current_code = code
-        review_log = []          # 记录每轮分歧，便于人工介入时定位是谁的问题
-        approved = False
-        for round_no in range(1, max_rounds + 1):
-            review_prompt = (
-                "你是代码审查员。判断以下代码是否安全可用。"
-                "只回答「通过」，或「不通过：<原因与修改建议>」。\n"
-                f"```python\n{current_code}\n```"
-            )
-            review = call_kimi(review_prompt)
-            if "不通过" not in review and "FAIL" not in review.upper():
-                approved = True
-                code = current_code
-                break
-            review_log.append(f"第 {round_no} 轮 · Kimi 否决：{review.strip()[:300]}")
-            # 让 DeepSeek 按审查意见修改，进入下一轮
-            fix_prompt = (
-                "根据以下审查意见修改代码，只输出完整可运行的 Python 代码，不要任何解释。\n"
-                f"审查意见：\n{review}\n\n"
-                f"原代码：\n```python\n{current_code}\n```"
-            )
-            fixed = call_deepseek([{"role": "user", "content": fix_prompt}])
-            m = re.search(r'```(?:python)?\n(.*?)```', fixed, re.DOTALL)
-            current_code = m.group(1).strip() if m else fixed.strip()
-            review_log.append(f"第 {round_no} 轮 · DeepSeek 修改后代码（前 200 字）：{current_code[:200]}")
-        if not approved:
-            detail = "\n".join(review_log)
-            return (
-                f"代码经 {max_rounds} 轮审查仍未通过，已主动终止避免死循环。\n"
-                f"请用户提供更多信息或放宽约束。\n【分歧过程】\n{detail}"
-            )
+        # 降本增效：意图等级分类，仅高危操作触发 Kimi 双AI审查；写UI/读普通文本等低风险直接放行
+        risk = classify_operation_risk(code)
+        if risk == 'low':
+            logger.info(f"[{name}] 代码意图等级=低危，跳过 Kimi 双AI审查，直接生成")
+        else:
+            # 漏洞3：多轮审查 + 死循环斩断，最多 max_review_rounds 轮，超限请求人工介入
+            max_rounds = CONFIG.get("max_review_rounds", 5)
+            current_code = code
+            review_log = []          # 记录每轮分歧，便于人工介入时定位是谁的问题
+            approved = False
+            for round_no in range(1, max_rounds + 1):
+                review_prompt = (
+                    "你是代码审查员。判断以下代码是否安全可用。"
+                    "只回答「通过」，或「不通过：<原因与修改建议>」。\n"
+                    f"```python\n{current_code}\n```"
+                )
+                review = call_kimi(review_prompt)
+                if "不通过" not in review and "FAIL" not in review.upper():
+                    approved = True
+                    code = current_code
+                    break
+                review_log.append(f"第 {round_no} 轮 · Kimi 否决：{review.strip()[:300]}")
+                # 让 DeepSeek 按审查意见修改，进入下一轮
+                fix_prompt = (
+                    "根据以下审查意见修改代码，只输出完整可运行的 Python 代码，不要任何解释。\n"
+                    f"审查意见：\n{review}\n\n"
+                    f"原代码：\n```python\n{current_code}\n```"
+                )
+                fixed = call_deepseek([{"role": "user", "content": fix_prompt}])
+                m = re.search(r'```(?:python)?\n(.*?)```', fixed, re.DOTALL)
+                current_code = m.group(1).strip() if m else fixed.strip()
+                review_log.append(f"第 {round_no} 轮 · DeepSeek 修改后代码（前 200 字）：{current_code[:200]}")
+            if not approved:
+                detail = "\n".join(review_log)
+                return (
+                    f"代码经 {max_rounds} 轮审查仍未通过，已主动终止避免死循环。\n"
+                    f"请用户提供更多信息或放宽约束。\n【分歧过程】\n{detail}"
+                )
 
     generated_dir = Path(CONFIG["skills_dir"]) / "generated"
     generated_dir.mkdir(parents=True, exist_ok=True)
@@ -1279,9 +1357,14 @@ def handle_direct_command(content, sender_id, identifier, message_type='private'
         allowed, reason = guard_command(tail)
         if not allowed:
             return True, f"⛔ {reason}"
+        # 动态行为指纹日志 + 连续长指令人工审核阈值
+        manual = log_behavior_fingerprint(get_current_uid(), 'exec', tail, cwd=os.getcwd(), env=os.environ)
         try:
             subprocess.Popen(normalize_newlines(tail), shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            return True, f"已启动: {tail}"
+            reply = f"已启动: {tail}"
+            if manual:
+                reply += "\n⚠️ 行为指纹异常：连续多次长指令，已触发人工审核，请管理员复核。"
+            return True, reply
         except Exception as e:
             return True, f"启动失败: {e}"
 
