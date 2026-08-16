@@ -12,6 +12,20 @@
 import os
 from pathlib import Path
 
+WORKSPACE_ROOT = Path(os.environ.get('LOBSTER_WORKSPACE', './workspace')).resolve()
+
+def _sandbox_check(path):
+    """漏洞6：路径沙盒校验，文件路径必须位于 workspace/{uid}/ 内"""
+    uid = os.environ.get('LOBSTER_CURRENT_UID', 'shared')
+    base = (WORKSPACE_ROOT / str(uid)).resolve()
+    try:
+        resolved = Path(path).resolve()
+    except Exception:
+        return False, f"路径无效: {path}"
+    if str(resolved) == str(base) or str(resolved).startswith(str(base) + os.sep):
+        return True, ""
+    return False, f"⛔ 路径越权：{path} 不在沙盒 {base} 内"
+
 def execute(action, path, content=None):
     """
     action: 'list', 'read', 'write'
@@ -19,6 +33,9 @@ def execute(action, path, content=None):
     content: 写入内容（仅 write 需要）
     """
     path = Path(path).resolve()
+    ok, reason = _sandbox_check(path)
+    if not ok:
+        return reason
     if action == 'list':
         if not path.exists():
             return f"路径不存在: {path}"

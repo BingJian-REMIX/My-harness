@@ -1,0 +1,11 @@
+# Python 字节码缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行时日志
+*.log
+
+# 会话/状态文件（本地运行时生成）
+deepseek_state.json
+kimi_state.json

@@ -61,6 +61,11 @@ CONFIG = {
     "code_review_enabled": True,
     "response_timeout": 30,
     "max_collab_rounds": 10,
+    "max_review_rounds": 5,                 # 双AI审查最大轮次，超过则请求人工介入
+    "max_message_chars": 3000,              # 单条消息硬截断阈值（字）
+    "command_guard_blacklist": True,        # 高危命令黑名单（第一层）
+    "command_guard_semantic": True,         # Kimi 语义鉴定（第二层）
+    "playwright_global_timeout": 30,        # Playwright 全局超时（秒）
     "enable_conversation_log": True,
     "enable_context_compression": True,
     "context_compression_threshold": 8000,
@@ -293,6 +298,7 @@ def load_md_skill(file_path, config):
 
 # ==================== AI 通信模块 ====================
 def call_ai_web(model, messages, state_file, url, textarea_selector, send_btn_selector, answer_selector):
+    global_timeout_ms = CONFIG.get("playwright_global_timeout", 30) * 1000
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=CONFIG["headless"])
         context = browser.new_context()
@@ -307,24 +313,51 @@ def call_ai_web(model, messages, state_file, url, textarea_selector, send_btn_se
                 context.storage_state(path=state_file)
             page.close()
         page = context.new_page()
-        page.goto(url)
-        page.wait_for_selector(textarea_selector, timeout=10000)
-        input_box = page.locator(textarea_selector).first
+        page.set_default_timeout(global_timeout_ms)
         # 构建完整提示
         if isinstance(messages, list):
             full_prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
         else:
             full_prompt = messages
-        input_box.fill(full_prompt)
-        send_btn = page.locator(send_btn_selector)
-        if not send_btn.count():
-            send_btn = page.locator("button[aria-label='发送']")
-        send_btn.click()
-        page.wait_for_selector("text=停止生成", state="detached", timeout=120000)
-        answers = page.locator(answer_selector)
-        reply = answers.last.inner_text()
-        browser.close()
-        return reply
+        try:
+            page.goto(url)
+            page.wait_for_selector(textarea_selector)
+            input_box = page.locator(textarea_selector).first
+            input_box.fill(full_prompt)
+            send_btn = page.locator(send_btn_selector)
+            if not send_btn.count():
+                send_btn = page.locator("button[aria-label='发送']")
+            send_btn.click()
+            page.wait_for_selector("text=停止生成", state="detached", timeout=120000)
+            answers = page.locator(answer_selector)
+            reply = answers.last.inner_text()
+            browser.close()
+            return reply
+        except Exception as e:
+            # 漏洞2：全局超时兜底，重载页面重试一次
+            logger.warning(f"[{model}] 页面操作异常/超时，重载浏览器会话: {e}")
+            try:
+                page.goto(url)
+                page.wait_for_selector(textarea_selector)
+                input_box = page.locator(textarea_selector).first
+                input_box.fill(full_prompt)
+                send_btn = page.locator(send_btn_selector)
+                if not send_btn.count():
+                    send_btn = page.locator("button[aria-label='发送']")
+                send_btn.click()
+                page.wait_for_selector("text=停止生成", state="detached", timeout=120000)
+                answers = page.locator(answer_selector)
+                reply = answers.last.inner_text()
+                browser.close()
+                logger.info(f"[{model}] 浏览器会话已重置并成功重试")
+                return reply
+            except Exception as e2:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                logger.error(f"[{model}] 重试后仍失败: {e2}")
+                return f"[{model}] 调用失败（会话已重置仍超时）: {e2}"
 
 def call_deepseek(messages):
     """调用 DeepSeek（主决策者）"""
@@ -349,6 +382,75 @@ def call_kimi(prompt):
         "button:has-text('发送')",
         ".markdown"
     )
+
+# ==================== 安全防护（漏洞加固） ====================
+
+# 漏洞1：高危命令黑名单（第一层，正则匹配关机/格式化/删盘/改启动项等）
+DANGEROUS_COMMAND_PATTERNS = [
+    r'\bshutdown\b', r'\breboot\b', r'\bstop-computer\b', r'\brestart-computer\b',
+    r'\bformat\b', r'\bdiskpart\b', r'\bfdisk\b', r'\bmkfs\b',
+    r'\bdel\b.*[\\/]system32', r'\brm\s+-rf\s+/', r'\bdeltree\b',
+    r'\bbcdedit\b', r'\breg\s+(add|delete)\b.*\b(run|runonce|autostart|boot)\b',
+    r'\bwmic\b.*\bdelete\b', r'\bremove-item\b.*\bsystem\b',
+    r'\bdd\s+if=.*of=/dev/(sd|nvme|hd|vd)',
+]
+
+def truncate_text(text, max_chars=None):
+    """漏洞4：本地硬截断，避免单条长文撑爆网页端上下文"""
+    if not text:
+        return text
+    limit = max_chars or CONFIG.get("max_message_chars", 3000)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [内容过长已截断，原长度 {len(text)} 字]"
+
+def normalize_newlines(text):
+    """漏洞5：统一换行符为 \\n，避免 Windows \\r\\n 在 Linux 下 command not found"""
+    if not text:
+        return text
+    return text.replace('\r\n', '\n').replace('\r', '\n')
+
+def sandbox_path_check(path, uid=None):
+    """漏洞6：路径沙盒校验，文件路径必须位于 workspace/{uid}/ 内"""
+    uid = uid or os.environ.get('LOBSTER_CURRENT_UID', 'shared')
+    try:
+        base = (WORKSPACE / str(uid)).resolve()
+        resolved = Path(path).resolve()
+        if str(resolved) == str(base) or str(resolved).startswith(str(base) + os.sep):
+            return True, ""
+        return False, f"路径越权：{path} 不在沙盒 {base} 内"
+    except Exception as e:
+        return False, f"路径校验失败: {e}"
+
+def semantic_danger_check(command):
+    """漏洞1：Kimi 操作意图语义鉴定（第二层）。返回 (是否放行, 原因)"""
+    try:
+        prompt = (
+            "你是安全审查员。判断下面这条命令是否存在高危操作意图"
+            "（关机/重启、格式化磁盘、删除系统文件、修改系统启动项、破坏系统等）。"
+            f"只回答两个字「通过」或「高危」，不要解释。\n命令：{command}"
+        )
+        review = call_kimi(prompt)
+        if any(k in review for k in ("高危", "不通过", "DANGER", "FAIL")):
+            return False, review.strip()[:120]
+        return True, ""
+    except Exception as e:
+        logger.warning(f"语义鉴定失败，按黑名单结果放行: {e}")
+        return True, ""
+
+def guard_command(command):
+    """漏洞1：命令执行统一防护入口。返回 (是否放行, 拦截原因)"""
+    cmd = normalize_newlines(command)
+    if CONFIG.get("command_guard_blacklist", True):
+        low = cmd.lower()
+        for pat in DANGEROUS_COMMAND_PATTERNS:
+            if re.search(pat, low):
+                return False, f"高危命令已拦截（命中: {pat}）"
+    if CONFIG.get("command_guard_semantic", True):
+        ok, reason = semantic_danger_check(cmd)
+        if not ok:
+            return False, f"高危操作不通过：{reason}"
+    return True, ""
 
 # ==================== 视觉操作（Kimi 视觉专家） ====================
 def builtin_screen_ops(action, target=None, use_kimi_vision=False, **kwargs):
@@ -423,7 +525,7 @@ def builtin_install_software(name, mode='winget', install_location='D:\\Software
     elif mode == 'script' and script_code:
         tmp_script = Path(WORKSPACE) / f"_install_{name}_{int(time.time())}.py"
         with open(tmp_script, 'w', encoding='utf-8') as f:
-            f.write(script_code)
+            f.write(normalize_newlines(script_code))
         try:
             result = subprocess.run(['python', str(tmp_script)], capture_output=True, text=True, timeout=300)
             tmp_script.unlink()
@@ -670,7 +772,7 @@ def send_to_shell(identifier, shell_type, command):
     output_queue = session['output_queue']
 
     try:
-        proc.stdin.write(command + '\n')
+        proc.stdin.write(normalize_newlines(command) + '\n')
         proc.stdin.flush()
     except Exception as e:
         return f"写入命令失败: {e}"
@@ -859,8 +961,12 @@ def build_system_prompt():
 pending_contexts = {}
 
 def execute_agent_loop(user_message, history, identifier, source, max_steps=5):
-    messages = history[-CONFIG["context_limit"]:].copy()
-    messages.append({"role": "user", "content": user_message})
+    # 漏洞4：对每条消息做本地硬截断，避免撑爆网页端上下文
+    messages = [
+        {"role": m.get("role", "user"), "content": truncate_text(m.get("content", ""))}
+        for m in history[-CONFIG["context_limit"]:]
+    ]
+    messages.append({"role": "user", "content": truncate_text(user_message)})
 
     # 1. 主决策者 DeepSeek 分析
     system_prompt = build_system_prompt()
@@ -922,12 +1028,37 @@ def skill_write_skill(**kwargs):
         return "缺少技能名称或代码"
 
     if CONFIG.get("code_review_enabled"):
-        initial_prompt = f"功能：{description}，参数：{parameters}。请生成包含execute函数的Python代码。当前代码草案：\n{code}"
-        # 使用 Kimi 审查（这里可复用之前的 collaborate 逻辑，但简化为单次审查）
-        review_prompt = f"请审查以下代码，给出通过/不通过及建议：\n{code}"
-        review = call_kimi(review_prompt)
-        if "不通过" in review or "FAIL" in review.upper():
-            return f"代码审查未通过：{review}"
+        # 漏洞3：多轮审查 + 死循环斩断，最多 max_review_rounds 轮，超限请求人工介入
+        max_rounds = CONFIG.get("max_review_rounds", 5)
+        current_code = code
+        final_review = ""
+        approved = False
+        for round_no in range(1, max_rounds + 1):
+            review_prompt = (
+                "你是代码审查员。判断以下代码是否安全可用。"
+                "只回答「通过」，或「不通过：<原因与修改建议>」。\n"
+                f"```python\n{current_code}\n```"
+            )
+            review = call_kimi(review_prompt)
+            if "不通过" not in review and "FAIL" not in review.upper():
+                approved = True
+                code = current_code
+                break
+            final_review = review
+            # 让 DeepSeek 按审查意见修改，进入下一轮
+            fix_prompt = (
+                "根据以下审查意见修改代码，只输出完整可运行的 Python 代码，不要任何解释。\n"
+                f"审查意见：\n{review}\n\n"
+                f"原代码：\n```python\n{current_code}\n```"
+            )
+            fixed = call_deepseek([{"role": "user", "content": fix_prompt}])
+            m = re.search(r'```(?:python)?\n(.*?)```', fixed, re.DOTALL)
+            current_code = m.group(1).strip() if m else fixed.strip()
+        if not approved:
+            return (
+                f"代码经 {max_rounds} 轮审查仍未通过，已主动终止避免死循环。"
+                f"请用户提供更多信息或放宽约束。最后一轮意见：{final_review[:200]}"
+            )
 
     generated_dir = Path(CONFIG["skills_dir"]) / "generated"
     generated_dir.mkdir(parents=True, exist_ok=True)
@@ -958,6 +1089,8 @@ def skill_write_skill(**kwargs):
 
 # ==================== 直接命令处理 ====================
 def handle_direct_command(content, sender_id, identifier):
+    # 漏洞6：记录当前操作用户 UID，供 file_ops 等技能做路径沙盒
+    os.environ['LOBSTER_CURRENT_UID'] = str(sender_id)
     if not content.startswith(CONFIG["direct_cmd_prefix"]):
         return False, None
     rest = content[1:].strip()
@@ -1032,8 +1165,11 @@ def handle_direct_command(content, sender_id, identifier):
     if cmd == 'exec':
         if not tail:
             return True, "用法: #exec <命令>"
+        allowed, reason = guard_command(tail)
+        if not allowed:
+            return True, f"⛔ {reason}"
         try:
-            subprocess.Popen(tail, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.Popen(normalize_newlines(tail), shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
             return True, f"已启动: {tail}"
         except Exception as e:
             return True, f"启动失败: {e}"
@@ -1055,6 +1191,9 @@ def handle_direct_command(content, sender_id, identifier):
                 return True, result
         else:
             command = parts2[1]
+            allowed, reason = guard_command(command)
+            if not allowed:
+                return True, f"⛔ {reason}"
             if not get_session(identifier, shell):
                 start_shell(identifier, shell)
             output = send_to_shell(identifier, shell, command)
@@ -1190,6 +1329,8 @@ queues = {}
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
 def process_message(identifier, msg, source):
+    # 漏洞6：记录当前操作用户 UID，供 file_ops 等技能做路径沙盒
+    os.environ['LOBSTER_CURRENT_UID'] = str(msg.get('sender_id', 'shared'))
     try:
         logger.info(f"处理消息: identifier={identifier}, sender={msg['sender_id']}, content={msg['content']}")
         history = source.get_history(identifier)
