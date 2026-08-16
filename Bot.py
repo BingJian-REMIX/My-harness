@@ -765,13 +765,14 @@ def log_behavior_fingerprint(uid, action, command, cwd=None, env=None):
 
 # ==================== 视觉操作（Kimi 视觉专家） ====================
 def builtin_screen_ops(action, target=None, use_kimi_vision=False, **kwargs):
-    """屏幕操作：点击、输入、OCR等，支持 Kimi 视觉辅助"""
+    """屏幕操作：点击、输入、OCR等，支持 Kimi 视觉辅助（截图会真实上传给 Kimi 网页版）"""
     if use_kimi_vision:
         # 截屏
         screenshot = pyautogui.screenshot()
         temp_path = WORKSPACE / f"_vision_{int(time.time())}.png"
         screenshot.save(temp_path)
-        # 调用 Kimi 分析
+        # 调用 Kimi 分析：改走 web_ai_agent 并上传截图，让 Kimi 真正"看到"图片。
+        # 旧的 call_kimi(vision_prompt) 只发文本、Kimi 收不到图，视觉分析实际上从未生效。
         vision_prompt = f"""请分析这张截图，并执行以下任务：
 动作：{action}
 目标：{target}
@@ -780,10 +781,12 @@ def builtin_screen_ops(action, target=None, use_kimi_vision=False, **kwargs):
 返回 JSON 格式操作指令：
 {{"actions": [{{"type": "click|type|scroll|wait|ocr", "x": 123, "y": 456, "text": "输入内容"}}]}}
 只输出 JSON，不要额外文字。"""
-        kimi_response = call_kimi(vision_prompt)
+        kimi_response = web_ai_agent(provider='kimi', prompt=vision_prompt, image_path=str(temp_path))
         try:
-            instructions = json.loads(kimi_response)
-        except:
+            # 稳健提取：Kimi 网页版可能用 ```json 包裹，取首个 {{...}} 块解析
+            _m = re.search(r'\{.*\}', kimi_response, re.DOTALL)
+            instructions = json.loads(_m.group() if _m else kimi_response)
+        except Exception:
             return f"Kimi 视觉分析失败: {kimi_response[:200]}"
         # 执行指令
         for cmd in instructions.get('actions', []):
