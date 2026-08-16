@@ -31,25 +31,3 @@ def execute(days=7):
                     pass
     return f"清理完成，释放了约 {total_freed // (1024*1024)} MB 空间。"
 ```
-
-### `skills/user/backup_files.py`
-
-```python
-"""
-备份指定目录到目标目录
-"""
-
-import shutil
-from pathlib import Path
-
-def execute(src, dst):
-    src = Path(src).resolve()
-    dst = Path(dst).resolve()
-    if not src.exists():
-        return f"源目录不存在: {src}"
-    try:
-        shutil.copytree(src, dst, dirs_exist_ok=True)
-        return f"已备份 {src} 到 {dst}"
-    except Exception as e:
-        return f"备份失败: {e}"
-```
