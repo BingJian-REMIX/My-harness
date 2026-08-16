@@ -403,6 +403,49 @@ def call_kimi(prompt):
         ".markdown"
     )
 
+# ==================== 网页版 AI 提供方（可扩展 Agent 池） ====================
+# 主脑可通过 web_ai_agent 调度任意网页版 AI 作为子 Agent。
+# 新增 AI：复制一项，填对 url 与页面选择器即可（选择器需按实际页面结构调整）。
+WEB_AI_PROVIDERS = {
+    'deepseek': {
+        'url': 'https://chat.deepseek.com',
+        'textarea': 'textarea',
+        'send_btn': "button:has-text('发送')",
+        'answer': '.ds-markdown',
+        'state_file': 'deepseek_state.json',
+    },
+    'kimi': {
+        'url': 'https://kimi.com',
+        'textarea': 'textarea',
+        'send_btn': "button:has-text('发送')",
+        'answer': '.markdown',
+        'state_file': 'kimi_state.json',
+    },
+    # 示例：其他网页版 AI（按实际页面结构调整选择器后取消注释即可）
+    # 'qwen': {
+    #     'url': 'https://tongyi.aliyun.com/qianwen',
+    #     'textarea': 'textarea',
+    #     'send_btn': "button:has-text('发送')",
+    #     'answer': '.markdown',
+    #     'state_file': 'qwen_state.json',
+    # },
+}
+
+def web_ai_agent(provider='deepseek', prompt='', system=None):
+    """调度指定网页版 AI 作为子 Agent 回答问题（主脑可调用的新 skill）"""
+    cfg = WEB_AI_PROVIDERS.get(provider)
+    if not cfg:
+        available = ', '.join(WEB_AI_PROVIDERS.keys())
+        return f"未知 AI 提供方: {provider}，当前可用: {available}"
+    messages = []
+    if system:
+        messages.append({'role': 'system', 'content': system})
+    messages.append({'role': 'user', 'content': prompt})
+    return call_ai_web(
+        provider, messages, cfg['state_file'],
+        cfg['url'], cfg['textarea'], cfg['send_btn'], cfg['answer']
+    )
+
 # ==================== 安全防护（漏洞加固） ====================
 
 # 漏洞1：高危命令黑名单（第一层，正则匹配关机/格式化/删盘/改启动项等）
@@ -1001,6 +1044,13 @@ def build_system_prompt():
 【与Kimi协作（视觉专家）】
 当任务需要操作屏幕上的图形界面（如点击按钮、输入文本、识别窗口）时，请调用 screen_ops 并设置 use_kimi_vision=True，Kimi 会作为视觉专家提供精确的坐标和操作指令。
 
+【调度其他 AI 作为子 Agent】
+你可以使用 web_ai_agent 技能打开其他网页版 AI 作为子 Agent 辅助完成任务：
+- 当需要第二意见、交叉验证、或让其他模型独立完成某个子任务时，调用 web_ai_agent。
+- 用法示例：{{"action": "web_ai_agent", "params": {{"provider": "kimi", "prompt": "请审查这段代码..."}}}}
+- provider 可选：deepseek, kimi（可在 WEB_AI_PROVIDERS 中扩展更多）。
+- 注意：这是通过浏览器打开网页版 AI，每次调用较慢，仅在确实需要时使用。
+
 【交互协议】
 你与脚本的每一次交互都必须遵循以下格式：
 - 输出必须是 JSON 对象，包含 "action" 和 "params" 字段。
@@ -1443,6 +1493,14 @@ def main():
     check_login_state()
     global SKILLS
     SKILLS = load_skills_plugin()
+    # 动态注册「调度其他网页版 AI」能力为一个新 skill，供主脑调度子 Agent
+    SKILLS['web_ai_agent'] = SkillPlugin(
+        'web_ai_agent',
+        web_ai_agent,
+        '调度指定的网页版 AI（deepseek/kimi 等）作为子 Agent 回答问题',
+        {'provider': 'AI 名', 'prompt': '要它回答的问题', 'system': '可选系统提示'},
+        True,
+    )
     logger.info(f"已加载 {len(SKILLS)} 个技能")
 
     # 启动定时任务调度器
