@@ -1,0 +1,17 @@
+{
+  "file_ops": {
+    "enabled": true
+  },
+  "system_info": {
+    "enabled": true
+  },
+  "web_scraper": {
+    "enabled": true
+  },
+  "clean_temp": {
+    "enabled": true
+  },
+  "backup_files": {
+    "enabled": false
+  }
+}

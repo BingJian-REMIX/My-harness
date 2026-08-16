@@ -1,0 +1,12 @@
+playwright
+beautifulsoup4
+requests
+websockets
+pyyaml
+pyautogui
+Pillow
+schedule
+pytesseract
+python-docx
+openpyxl
+python-pptx
