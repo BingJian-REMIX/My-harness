@@ -210,6 +210,12 @@ class SkillPlugin:
         if not self.enabled:
             return f"技能 {self.name} 已禁用"
         try:
+            # 漏洞6：向支持沙盒参数的技能注入当前用户上下文（uid 来自真实发送者）
+            sig = inspect.signature(self.func)
+            if '__uid__' in sig.parameters:
+                kwargs['__uid__'] = get_current_uid()
+            if '__sandbox_root__' in sig.parameters:
+                kwargs['__sandbox_root__'] = str(get_sandbox_root())
             return self.func(**kwargs)
         except Exception as e:
             return f"执行技能 {self.name} 失败: {e}"
@@ -334,9 +340,23 @@ def call_ai_web(model, messages, state_file, url, textarea_selector, send_btn_se
             browser.close()
             return reply
         except Exception as e:
-            # 漏洞2：全局超时兜底，重载页面重试一次
+            # 漏洞2：全局超时兜底，重载页面重试一次（保留 cookie 与 localStorage 登录态）
             logger.warning(f"[{model}] 页面操作异常/超时，重载浏览器会话: {e}")
             try:
+                # 先保存当前登录态（cookie + localStorage），避免重载后跳登录页
+                try:
+                    context.storage_state(path=state_file)
+                except Exception as se:
+                    logger.warning(f"[{model}] 保存 storage_state 失败: {se}")
+                # 用保留的 storage_state 重建 context，确保重试后仍在登录态
+                if os.path.exists(state_file):
+                    context = browser.new_context(storage_state=state_file)
+                else:
+                    context = browser.new_context()
+                page = context.new_page()
+                page.set_default_timeout(global_timeout_ms)
+                page.evaluate('console.log("页面正在恢复")')
+                page.wait_for_timeout(1000)
                 page.goto(url)
                 page.wait_for_selector(textarea_selector)
                 input_box = page.locator(textarea_selector).first
@@ -387,22 +407,37 @@ def call_kimi(prompt):
 
 # 漏洞1：高危命令黑名单（第一层，正则匹配关机/格式化/删盘/改启动项等）
 DANGEROUS_COMMAND_PATTERNS = [
+    # 高危动作关键词
     r'\bshutdown\b', r'\breboot\b', r'\bstop-computer\b', r'\brestart-computer\b',
     r'\bformat\b', r'\bdiskpart\b', r'\bfdisk\b', r'\bmkfs\b',
     r'\bdel\b.*[\\/]system32', r'\brm\s+-rf\s+/', r'\bdeltree\b',
     r'\bbcdedit\b', r'\breg\s+(add|delete)\b.*\b(run|runonce|autostart|boot)\b',
     r'\bwmic\b.*\bdelete\b', r'\bremove-item\b.*\bsystem\b',
     r'\bdd\s+if=.*of=/dev/(sd|nvme|hd|vd)',
+    # 二次执行入口（拼接/绕过载体，如 cmd /c shutdown）
+    r'\bcmd(\.exe)?\s+/[ck]\b',
+    r'\bpowershell(\.exe)?\b[^\r\n]*-(c|command|enc|encodedcommand)\b',
+    r'\bbash\s+-c\b', r'\bsh\s+-c\b',
+    r'\bwscript(\.exe)?\b', r'\bcscript(\.exe)?\b', r'\bmshta(\.exe)?\b',
+    # 元字符注入 / 命令替换 / 命令链连续使用
+    r'\$\s*\(', r'`[^`]*`', r';\s*;', r'&&', r'\|\|',
 ]
 
 def truncate_text(text, max_chars=None):
-    """漏洞4：本地硬截断，避免单条长文撑爆网页端上下文"""
+    """漏洞4：本地硬截断，优先在换行符处截断，避免生切代码行导致语法错误"""
     if not text:
         return text
     limit = max_chars or CONFIG.get("max_message_chars", 3000)
     if len(text) <= limit:
         return text
-    return text[:limit] + f"\n... [内容过长已截断，原长度 {len(text)} 字]"
+    # 在 limit 之前找最近的换行符，尽量在完整行边界截断
+    window = text[:limit]
+    cut = window.rfind('\n')
+    if cut > limit * 0.5:
+        head = text[:cut]
+    else:
+        head = text[:limit]
+    return head + f"\n... [内容过长已截断，原长度 {len(text)} 字]"
 
 def normalize_newlines(text):
     """漏洞5：统一换行符为 \\n，避免 Windows \\r\\n 在 Linux 下 command not found"""
@@ -410,11 +445,33 @@ def normalize_newlines(text):
         return text
     return text.replace('\r\n', '\n').replace('\r', '\n')
 
-def sandbox_path_check(path, uid=None):
-    """漏洞6：路径沙盒校验，文件路径必须位于 workspace/{uid}/ 内"""
-    uid = uid or os.environ.get('LOBSTER_CURRENT_UID', 'shared')
+# 漏洞6：线程级用户上下文（uid 来自真实消息发送者，非任意传入字符串）
+_msg_ctx = threading.local()
+
+def set_current_message(msg):
+    """设置当前线程正在处理的消息上下文（线程隔离，避免并发串扰）"""
+    _msg_ctx.uid = str(msg.get('sender_id', ''))
+    _msg_ctx.message_type = msg.get('message_type', 'private')
+    _msg_ctx.group_id = str(msg.get('group_id', '')) if msg.get('group_id') else None
+
+def get_current_uid():
+    """获取当前操作用户 UID（真实发送者，未设置时回退 shared）"""
+    uid = getattr(_msg_ctx, 'uid', None)
+    return uid if uid else 'shared'
+
+def get_sandbox_root():
+    """当前用户沙盒根：私聊 workspace/{uid}/，群聊 workspace/group_{gid}/{uid}/"""
+    uid = get_current_uid()
+    msg_type = getattr(_msg_ctx, 'message_type', 'private')
+    group_id = getattr(_msg_ctx, 'group_id', None)
+    if msg_type == 'group' and group_id:
+        return WORKSPACE / f"group_{group_id}" / uid
+    return WORKSPACE / uid
+
+def sandbox_path_check(path, uid=None, sandbox_root=None):
+    """漏洞6：路径沙盒校验，文件路径必须位于当前用户的沙盒根内"""
     try:
-        base = (WORKSPACE / str(uid)).resolve()
+        base = Path(sandbox_root).resolve() if sandbox_root else get_sandbox_root().resolve()
         resolved = Path(path).resolve()
         if str(resolved) == str(base) or str(resolved).startswith(str(base) + os.sep):
             return True, ""
@@ -513,7 +570,7 @@ def builtin_screen_ops(action, target=None, use_kimi_vision=False, **kwargs):
 def builtin_install_software(name, mode='winget', install_location='D:\\Software', script_code=None):
     if mode == 'winget':
         Path(install_location).mkdir(parents=True, exist_ok=True)
-        cmd = f'winget install --accept-package-agreements --install-location "{install_location}" "{name}"'
+        cmd = normalize_newlines(f'winget install --accept-package-agreements --install-location "{install_location}" "{name}"')
         try:
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
             if result.returncode == 0:
@@ -540,7 +597,7 @@ def builtin_install_software(name, mode='winget', install_location='D:\\Software
 
 def builtin_open_app(path):
     try:
-        subprocess.Popen([path], shell=True)
+        subprocess.Popen([normalize_newlines(path)], shell=True)
         return f"已打开 {path}"
     except Exception as e:
         return f"打开失败: {e}"
@@ -843,6 +900,7 @@ class NapCatSource:
         message = re.sub(r'\[CQ:[^\]]+\]', '', raw_message).strip()
         if not user_id or not message:
             return
+        group_id = None
         if msg_type == 'private':
             identifier = f"private_{user_id}"
         elif msg_type == 'group':
@@ -864,6 +922,7 @@ class NapCatSource:
             'content': message,
             'identifier': identifier,
             'message_type': msg_type,
+            'group_id': group_id,
         }
         self.msg_queue.put(msg)
 
@@ -1031,7 +1090,7 @@ def skill_write_skill(**kwargs):
         # 漏洞3：多轮审查 + 死循环斩断，最多 max_review_rounds 轮，超限请求人工介入
         max_rounds = CONFIG.get("max_review_rounds", 5)
         current_code = code
-        final_review = ""
+        review_log = []          # 记录每轮分歧，便于人工介入时定位是谁的问题
         approved = False
         for round_no in range(1, max_rounds + 1):
             review_prompt = (
@@ -1044,7 +1103,7 @@ def skill_write_skill(**kwargs):
                 approved = True
                 code = current_code
                 break
-            final_review = review
+            review_log.append(f"第 {round_no} 轮 · Kimi 否决：{review.strip()[:300]}")
             # 让 DeepSeek 按审查意见修改，进入下一轮
             fix_prompt = (
                 "根据以下审查意见修改代码，只输出完整可运行的 Python 代码，不要任何解释。\n"
@@ -1054,10 +1113,12 @@ def skill_write_skill(**kwargs):
             fixed = call_deepseek([{"role": "user", "content": fix_prompt}])
             m = re.search(r'```(?:python)?\n(.*?)```', fixed, re.DOTALL)
             current_code = m.group(1).strip() if m else fixed.strip()
+            review_log.append(f"第 {round_no} 轮 · DeepSeek 修改后代码（前 200 字）：{current_code[:200]}")
         if not approved:
+            detail = "\n".join(review_log)
             return (
-                f"代码经 {max_rounds} 轮审查仍未通过，已主动终止避免死循环。"
-                f"请用户提供更多信息或放宽约束。最后一轮意见：{final_review[:200]}"
+                f"代码经 {max_rounds} 轮审查仍未通过，已主动终止避免死循环。\n"
+                f"请用户提供更多信息或放宽约束。\n【分歧过程】\n{detail}"
             )
 
     generated_dir = Path(CONFIG["skills_dir"]) / "generated"
@@ -1088,9 +1149,9 @@ def skill_write_skill(**kwargs):
     return f"技能 {name} 已创建并启用。"
 
 # ==================== 直接命令处理 ====================
-def handle_direct_command(content, sender_id, identifier):
-    # 漏洞6：记录当前操作用户 UID，供 file_ops 等技能做路径沙盒
-    os.environ['LOBSTER_CURRENT_UID'] = str(sender_id)
+def handle_direct_command(content, sender_id, identifier, message_type='private', group_id=None):
+    # 漏洞6：设置当前线程用户上下文（uid 来自真实发送者，区分群聊/私聊）
+    set_current_message({'sender_id': sender_id, 'message_type': message_type, 'group_id': group_id})
     if not content.startswith(CONFIG["direct_cmd_prefix"]):
         return False, None
     rest = content[1:].strip()
@@ -1329,8 +1390,8 @@ queues = {}
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
 def process_message(identifier, msg, source):
-    # 漏洞6：记录当前操作用户 UID，供 file_ops 等技能做路径沙盒
-    os.environ['LOBSTER_CURRENT_UID'] = str(msg.get('sender_id', 'shared'))
+    # 漏洞6：设置当前线程用户上下文（uid 来自真实发送者，线程隔离）
+    set_current_message(msg)
     try:
         logger.info(f"处理消息: identifier={identifier}, sender={msg['sender_id']}, content={msg['content']}")
         history = source.get_history(identifier)
@@ -1406,7 +1467,7 @@ def main():
                     logger.info(f"⛔ 用户 {msg['sender_nick']}({sender_id}) 无权限")
                     continue
 
-                handled, reply = handle_direct_command(content, sender_id, identifier)
+                handled, reply = handle_direct_command(content, sender_id, identifier, msg.get('message_type', 'private'), msg.get('group_id'))
                 if handled:
                     source.send_reply(identifier, reply)
                     continue

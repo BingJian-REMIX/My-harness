@@ -14,10 +14,13 @@ from pathlib import Path
 
 WORKSPACE_ROOT = Path(os.environ.get('LOBSTER_WORKSPACE', './workspace')).resolve()
 
-def _sandbox_check(path):
-    """漏洞6：路径沙盒校验，文件路径必须位于 workspace/{uid}/ 内"""
-    uid = os.environ.get('LOBSTER_CURRENT_UID', 'shared')
-    base = (WORKSPACE_ROOT / str(uid)).resolve()
+def _sandbox_check(path, __sandbox_root__=None):
+    """漏洞6：路径沙盒校验，文件路径必须位于当前用户沙盒内（群聊/私聊区分）"""
+    if __sandbox_root__:
+        base = Path(__sandbox_root__).resolve()
+    else:
+        uid = os.environ.get('LOBSTER_CURRENT_UID', 'shared')
+        base = (WORKSPACE_ROOT / str(uid)).resolve()
     try:
         resolved = Path(path).resolve()
     except Exception:
@@ -26,14 +29,16 @@ def _sandbox_check(path):
         return True, ""
     return False, f"⛔ 路径越权：{path} 不在沙盒 {base} 内"
 
-def execute(action, path, content=None):
+def execute(action, path, content=None, __uid__=None, __sandbox_root__=None):
     """
     action: 'list', 'read', 'write'
     path: 文件或目录路径
     content: 写入内容（仅 write 需要）
+    __uid__: 当前操作用户 UID（由 Bot 注入，来自真实发送者）
+    __sandbox_root__: 当前用户沙盒根（由 Bot 注入，群聊/私聊区分）
     """
     path = Path(path).resolve()
-    ok, reason = _sandbox_check(path)
+    ok, reason = _sandbox_check(path, __sandbox_root__)
     if not ok:
         return reason
     if action == 'list':
