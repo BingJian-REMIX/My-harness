@@ -8,7 +8,7 @@
    ```bash
    pip install -r requirements.txt
    playwright install chromium
-```
+   ```
 
 2. 修改 bot.py 中的 CONFIG["admin_qq"] 为你的 QQ 号。
 3. 配置 NapCat（OneBot 协议端），确保 WebSocket 地址为 ws://127.0.0.1:6700。
