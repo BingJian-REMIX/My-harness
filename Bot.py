@@ -68,6 +68,7 @@ CONFIG = {
     "command_guard_semantic": True,         # Kimi 语义鉴定（第二层）
     "long_command_chars": 200,              # 行为指纹：单条命令超过此长度视为“长指令”
     "long_command_review_threshold": 3,     # 行为指纹：连续 N 次长指令触发人工审核
+    "max_sub_agents": 3,                     # 子 Agent（网页版 AI）并发上限，避免狂热申请浏览器实例
     "playwright_global_timeout": 30,        # Playwright 全局超时（秒）
     "enable_conversation_log": True,
     "enable_context_compression": True,
@@ -448,6 +449,90 @@ def web_ai_agent(provider='deepseek', prompt='', system=None):
         provider, messages, cfg['state_file'],
         cfg['url'], cfg['textarea'], cfg['send_btn'], cfg['answer']
     )
+
+# ==================== 子 Agent 并发调度器（LobsterScheduler） ====================
+# 控制同时拉起的网页版 AI / 浏览器实例数量，避免狂热申请浏览器实例。
+# 采用「常驻消费者线程 + 线程池」实现（与本项目同步 Playwright 栈一致，
+# 不引入第二套事件循环），并发上限由 ThreadPoolExecutor 把守。
+_SENTINEL = object()
+
+class LobsterScheduler:
+    """并发受限的子 Agent 调度器。
+
+    - 队列无界，submit 永不阻塞（契合“绝不阻塞”诉求）。
+    - 单一常驻消费者线程从队列取任务并派发到线程池，杜绝消费者协程 fan-out。
+    - 并发硬上限由 ThreadPoolExecutor(max_workers) 把守；取不到任务不占槽位，无幽灵 worker。
+    - run_sub_agent 异常被隔离并记录行为指纹，绝不静默消失。
+    - 支持 task_done() / shutdown() 做优雅关闭。
+    """
+    def __init__(self, max_workers: int = 3):
+        self._max_workers = max_workers
+        self._queue = queue.Queue()                      # 默认无界：put 永不阻塞
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix='lobster-sub'
+        )
+        self._shutdown = threading.Event()
+        self._consumer = threading.Thread(target=self._process_queue, daemon=True)
+        self._consumer.start()
+
+    def submit(self, task_payload):
+        """提交一个子 Agent 任务。队列无界，永不阻塞。"""
+        if self._shutdown.is_set():
+            raise RuntimeError("scheduler 已关闭，拒绝新任务")
+        self._queue.put(task_payload)
+
+    def _process_queue(self):
+        # 单一常驻消费者：阻塞取任务并派发到线程池；收到哨兵即退出。
+        while True:
+            task = self._queue.get()
+            if task is _SENTINEL:
+                self._queue.task_done()
+                break
+            self._executor.submit(self._run_guarded, task)
+
+    def _run_guarded(self, task):
+        try:
+            run_sub_agent(task)
+        except Exception as exc:
+            logger.error(f"[LobsterScheduler] 子 Agent 执行失败: {exc}")
+            try:
+                log_behavior_fingerprint(
+                    uid=task.get('uid') if isinstance(task, dict) else None,
+                    op='sub_agent_error', command=str(exc)[:200],
+                )
+            except Exception:
+                pass
+        finally:
+            self._queue.task_done()
+
+    def shutdown(self, grace: float = 30.0):
+        """停止接收新任务并等待在途子 Agent 完成。"""
+        self._shutdown.set()
+        self._queue.put(_SENTINEL)
+        self._executor.shutdown(wait=True)        # 等待在途子 Agent 完成（run_sub_agent 自带 30s 超时兜底）
+        if self._consumer.is_alive():
+            self._consumer.join(timeout=grace)
+
+
+def run_sub_agent(task):
+    """执行一个子 Agent 任务：内部复用 web_ai_agent 拉起网页版 AI。"""
+    provider = (task or {}).get('provider', 'deepseek')
+    prompt = (task or {}).get('prompt', '')
+    system = (task or {}).get('system')
+    return web_ai_agent(provider=provider, prompt=prompt, system=system)
+
+
+def dispatch_sub_agent(provider='deepseek', prompt='', system=None):
+    """非阻塞地把子 Agent 任务交给 LobsterScheduler（供主脑提示词触发）。"""
+    lobster_scheduler.submit({
+        'provider': provider, 'prompt': prompt, 'system': system,
+        'uid': get_current_uid(),
+    })
+    return f"✅ 已提交子 Agent 任务（provider={provider}），由调度器并发执行（上限 {lobster_scheduler._max_workers}）。"
+
+
+# 全局调度器实例（并发上限取 CONFIG.max_sub_agents）
+lobster_scheduler = LobsterScheduler(max_workers=CONFIG.get('max_sub_agents', 3))
 
 # ==================== 安全防护（漏洞加固） ====================
 
@@ -1124,6 +1209,12 @@ def build_system_prompt():
 - provider 可选：deepseek, kimi（可在 WEB_AI_PROVIDERS 中扩展更多）。
 - 注意：这是通过浏览器打开网页版 AI，每次调用较慢，仅在确实需要时使用。
 
+你可以使用 dispatch_sub_agent 技能把多个子 Agent 任务交给 LobsterScheduler 并发调度（上限 CONFIG.max_sub_agents，默认 3）：
+- 当需要一次性派发多条独立子任务、又不想同步阻塞主脑回复时，用 dispatch_sub_agent 替代 web_ai_agent。
+- 用法示例：{{"action": "dispatch_sub_agent", "params": {{"provider": "deepseek", "prompt": "并行分析这 5 个日志文件..."}}}}
+- 调度器自带并发上限，狂热派发也不会同时拉起超过上限的浏览器实例；失败会被隔离并记录行为指纹。
+- 若需要同步拿到结果再继续，仍用 web_ai_agent。
+
 【交互协议】
 你与脚本的每一次交互都必须遵循以下格式：
 - 输出必须是 JSON 对象，包含 "action" 和 "params" 字段。
@@ -1584,6 +1675,14 @@ def main():
         {'provider': 'AI 名', 'prompt': '要它回答的问题', 'system': '可选系统提示'},
         True,
     )
+    # 动态注册「并发调度子 Agent」能力为一个新 skill，供主脑通过提示词触发
+    SKILLS['dispatch_sub_agent'] = SkillPlugin(
+        'dispatch_sub_agent',
+        dispatch_sub_agent,
+        '将子 Agent 任务（网页版 AI）交给 LobsterScheduler 并发调度，不阻塞主脑回复',
+        {'provider': 'AI 名(deepseek/kimi)', 'prompt': '要它回答的问题', 'system': '可选系统提示'},
+        True,
+    )
     logger.info(f"已加载 {len(SKILLS)} 个技能")
 
     # 启动定时任务调度器
@@ -1622,6 +1721,10 @@ def main():
                 executor.submit(process_message, identifier, msg, source)
         except KeyboardInterrupt:
             logger.info("用户中断，退出程序")
+            try:
+                lobster_scheduler.shutdown()
+            except Exception:
+                pass
             break
         except Exception as e:
             logger.error(f"主循环异常: {e}")
