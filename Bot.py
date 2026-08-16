@@ -307,7 +307,40 @@ def load_md_skill(file_path, config):
         return None
 
 # ==================== AI 通信模块 ====================
-def call_ai_web(model, messages, state_file, url, textarea_selector, send_btn_selector, answer_selector):
+def _fill_and_send(page, full_prompt, textarea_selector, send_btn_selector,
+                   file_paths=None, file_input_selector=None):
+    """在网页版 AI 输入框填充提示并（可选）上传附件后发送。
+
+    附件上传原理：网页版 AI（DeepSeek/Kimi 等）通常挂一个隐藏的 <input type="file">，
+    Playwright 的 set_input_files 直接把本地文件塞进该控件（无需先点上传按钮、控件可不可见都行），
+    AI 服务端收到图片后会自动进行视觉理解/OCR。发送前等待片刻让附件预览就绪，避免发空附件。
+    """
+    page.wait_for_selector(textarea_selector)
+    # 1) 先上传附件（若存在）
+    if file_paths:
+        files = [file_paths] if isinstance(file_paths, str) else list(file_paths)
+        exist = [f for f in files if os.path.exists(f)]
+        if not exist:
+            logger.warning(f"附件不存在，跳过上传: {files}")
+        else:
+            sel = file_input_selector or "input[type=file]"
+            inputs = page.locator(sel)
+            if inputs.count():
+                inputs.first.set_input_files(exist)
+                page.wait_for_timeout(CONFIG.get("file_upload_wait_ms", 2000))
+            else:
+                logger.warning(f"未找到文件上传控件（{sel}），跳过附件上传")
+    # 2) 填提示 + 点发送
+    input_box = page.locator(textarea_selector).first
+    input_box.fill(full_prompt)
+    send_btn = page.locator(send_btn_selector)
+    if not send_btn.count():
+        send_btn = page.locator("button[aria-label='发送']")
+    send_btn.click()
+
+
+def call_ai_web(model, messages, state_file, url, textarea_selector, send_btn_selector, answer_selector,
+                file_paths=None, file_input_selector=None):
     global_timeout_ms = CONFIG.get("playwright_global_timeout", 30) * 1000
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=CONFIG["headless"])
@@ -331,13 +364,7 @@ def call_ai_web(model, messages, state_file, url, textarea_selector, send_btn_se
             full_prompt = messages
         try:
             page.goto(url)
-            page.wait_for_selector(textarea_selector)
-            input_box = page.locator(textarea_selector).first
-            input_box.fill(full_prompt)
-            send_btn = page.locator(send_btn_selector)
-            if not send_btn.count():
-                send_btn = page.locator("button[aria-label='发送']")
-            send_btn.click()
+            _fill_and_send(page, full_prompt, textarea_selector, send_btn_selector, file_paths, file_input_selector)
             page.wait_for_selector("text=停止生成", state="detached", timeout=120000)
             answers = page.locator(answer_selector)
             reply = answers.last.inner_text()
@@ -362,13 +389,7 @@ def call_ai_web(model, messages, state_file, url, textarea_selector, send_btn_se
                 page.evaluate('console.log("页面正在恢复")')
                 page.wait_for_timeout(1000)
                 page.goto(url)
-                page.wait_for_selector(textarea_selector)
-                input_box = page.locator(textarea_selector).first
-                input_box.fill(full_prompt)
-                send_btn = page.locator(send_btn_selector)
-                if not send_btn.count():
-                    send_btn = page.locator("button[aria-label='发送']")
-                send_btn.click()
+                _fill_and_send(page, full_prompt, textarea_selector, send_btn_selector, file_paths, file_input_selector)
                 page.wait_for_selector("text=停止生成", state="detached", timeout=120000)
                 answers = page.locator(answer_selector)
                 reply = answers.last.inner_text()
@@ -417,6 +438,7 @@ WEB_AI_PROVIDERS = {
         'send_btn': "button:has-text('发送')",
         'answer': '.ds-markdown',
         'state_file': 'deepseek_state.json',
+        'file_input': "input[type=file]",
     },
     'kimi': {
         'url': 'https://kimi.com',
@@ -424,6 +446,7 @@ WEB_AI_PROVIDERS = {
         'send_btn': "button:has-text('发送')",
         'answer': '.markdown',
         'state_file': 'kimi_state.json',
+        'file_input': "input[type=file]",
     },
     # 示例：其他网页版 AI（按实际页面结构调整选择器后取消注释即可）
     # 'qwen': {
@@ -435,8 +458,11 @@ WEB_AI_PROVIDERS = {
     # },
 }
 
-def web_ai_agent(provider='deepseek', prompt='', system=None):
-    """调度指定网页版 AI 作为子 Agent 回答问题（主脑可调用的新 skill）"""
+def web_ai_agent(provider='deepseek', prompt='', system=None, image_path=None, file_paths=None):
+    """调度指定网页版 AI 作为子 Agent 回答问题（主脑可调用的新 skill）。
+
+    支持传图片/文件：image_path 或 file_paths（列表）会被上传给网页版 AI，由其自动视觉理解/OCR。
+    """
     cfg = WEB_AI_PROVIDERS.get(provider)
     if not cfg:
         available = ', '.join(WEB_AI_PROVIDERS.keys())
@@ -445,9 +471,14 @@ def web_ai_agent(provider='deepseek', prompt='', system=None):
     if system:
         messages.append({'role': 'system', 'content': system})
     messages.append({'role': 'user', 'content': prompt})
+    files = list(file_paths) if file_paths else []
+    if image_path:
+        files.append(image_path)
     return call_ai_web(
         provider, messages, cfg['state_file'],
-        cfg['url'], cfg['textarea'], cfg['send_btn'], cfg['answer']
+        cfg['url'], cfg['textarea'], cfg['send_btn'], cfg['answer'],
+        file_paths=files or None,
+        file_input_selector=cfg.get('file_input'),
     )
 
 # ==================== 子 Agent 并发调度器（LobsterScheduler） ====================
@@ -519,7 +550,10 @@ def run_sub_agent(task):
     provider = (task or {}).get('provider', 'deepseek')
     prompt = (task or {}).get('prompt', '')
     system = (task or {}).get('system')
-    answer = web_ai_agent(provider=provider, prompt=prompt, system=system)
+    image_path = (task or {}).get('image_path')
+    file_paths = (task or {}).get('file_paths') or []
+    answer = web_ai_agent(provider=provider, prompt=prompt, system=system,
+                          image_path=image_path, file_paths=file_paths)
     # 结果路由：其他用户触发的 → 回传该用户会话；主脑(admin)触发的 → 回传主脑会话。
     # 二者统一为「回传到提交任务时记录的触发 identifier」，由 execute_agent_loop 在工作线程内写入。
     identifier = task.get('identifier')
@@ -531,9 +565,10 @@ def run_sub_agent(task):
     return answer
 
 
-def dispatch_sub_agent(provider='deepseek', prompt='', system=None):
+def dispatch_sub_agent(provider='deepseek', prompt='', system=None, image_path=None, file_paths=None):
     """非阻塞地把子 Agent 任务交给 LobsterScheduler（供主脑提示词触发）。
 
+    支持附图/附件：image_path 或 file_paths 会随任务上传给网页版 AI 做视觉理解/OCR。
     触发会话标识（identifier）在提交时从当前上下文捕获，子 Agent 完成后据此回传：
     - 由其他用户消息触发 → 结果回传该用户；
     - 由主脑(admin)自身触发 → 结果回传主脑会话。
@@ -541,6 +576,7 @@ def dispatch_sub_agent(provider='deepseek', prompt='', system=None):
     lobster_scheduler.submit({
         'provider': provider, 'prompt': prompt, 'system': system,
         'uid': get_current_uid(), 'identifier': get_current_identifier(),
+        'image_path': image_path, 'file_paths': file_paths,
     })
     return f"✅ 已提交子 Agent 任务（provider={provider}），由调度器并发执行（上限 {lobster_scheduler._max_workers}），完成后将回传至触发会话。"
 
@@ -1254,6 +1290,7 @@ def build_system_prompt():
 你可以使用 dispatch_sub_agent 技能把多个子 Agent 任务交给 LobsterScheduler 并发调度（上限 CONFIG.max_sub_agents，默认 3）：
 - 当需要一次性派发多条独立子任务、又不想同步阻塞主脑回复时，用 dispatch_sub_agent 替代 web_ai_agent。
 - 用法示例：{{"action": "dispatch_sub_agent", "params": {{"provider": "deepseek", "prompt": "并行分析这 5 个日志文件..."}}}}
+- 需要让子 Agent 看图/OCR：params 里加 "image_path"（单图）或 "file_paths"（多文件列表），会自动上传给网页版 AI 做视觉理解。
 - 调度器自带并发上限，狂热派发也不会同时拉起超过上限的浏览器实例；失败会被隔离并记录行为指纹。
 - 若需要同步拿到结果再继续，仍用 web_ai_agent。
 
@@ -1731,7 +1768,7 @@ def main():
         'dispatch_sub_agent',
         dispatch_sub_agent,
         '将子 Agent 任务（网页版 AI）交给 LobsterScheduler 并发调度，不阻塞主脑回复',
-        {'provider': 'AI 名(deepseek/kimi)', 'prompt': '要它回答的问题', 'system': '可选系统提示'},
+        {'provider': 'AI 名(deepseek/kimi)', 'prompt': '要它回答的问题', 'system': '可选系统提示', 'image_path': '可选：附图路径', 'file_paths': '可选：多文件路径列表'},
         True,
     )
     logger.info(f"已加载 {len(SKILLS)} 个技能")
